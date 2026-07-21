@@ -164,15 +164,17 @@ def parse_signal_code_date(code):
 # ---------------------------------------------------------------------------
 
 class Anomaly:
-    def __init__(self, dimension, response_code, water_point_id, description, details=""):
+    def __init__(self, dimension, subdimension, response_code, water_point_id, description, details=""):
         self.dimension = dimension
+        self.subdimension = subdimension
         self.response_code = response_code
         self.water_point_id = water_point_id
         self.description = description
         self.details = details
 
     def as_row(self):
-        return [self.dimension, self.response_code, self.water_point_id, self.description, self.details]
+        return [self.dimension, self.subdimension, self.response_code, self.water_point_id,
+                self.description, self.details]
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +193,7 @@ def check_completude(appel_rows, client_id=None):
 
         if status == "Draft":
             anomalies.append(Anomaly(
-                "Complétude", rc, wp,
+                "Complétude", "Brouillon non soumis", rc, wp,
                 "Brouillon jamais soumis",
                 f"Drafted On: {r.get('Drafted On', '')}",
             ))
@@ -211,13 +213,13 @@ def check_completude(appel_rows, client_id=None):
             # La réponse contient bien une référence à un Water Point, mais le datagrid
             # l'exporte vide -> le site lié a probablement été supprimé/est inaccessible.
             anomalies.append(Anomaly(
-                "Complétude", rc, "",
+                "Complétude", "Site associé supprimé/inaccessible", rc, "",
                 "Water Point ID répondu mais site associé supprimé ou inaccessible",
                 "Non résolu dans l'export mWater malgré une réponse valide (à vérifier dans le portail)",
             ))
         else:
             anomalies.append(Anomaly(
-                "Complétude", rc, "",
+                "Complétude", "Water Point ID manquant", rc, "",
                 "Réponse finalisée sans Water Point ID renseigné",
             ))
     return anomalies
@@ -234,7 +236,8 @@ def check_promptitude(appel_rows):
         submitted = parse_dt(r.get("Submitted On"))
         if drafted and submitted and submitted < drafted:
             anomalies.append(Anomaly(
-                "Promptitude", r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
+                "Promptitude", "Chronologie Drafted/Submitted",
+                r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
                 "Submitted On antérieur à Drafted On",
                 f"Drafted On: {drafted} / Submitted On: {submitted}",
             ))
@@ -253,13 +256,13 @@ def check_validite(appel_rows):
         signal_ref = r.get("Signal reference", "").strip()
         if signal_ref and not SIGNAL_CODE_RE.match(signal_ref):
             anomalies.append(Anomaly(
-                "Validité", rc, wp,
+                "Validité", "Format signal code", rc, wp,
                 "Signal reference ne respecte pas le format attendu",
                 f"Valeur : '{signal_ref}'",
             ))
         if wp and not wp.strip().isdigit():
             anomalies.append(Anomaly(
-                "Validité", rc, wp,
+                "Validité", "Format Water Point ID", rc, wp,
                 "Water Point ID non numérique",
             ))
     return anomalies
@@ -283,7 +286,8 @@ def check_unicite(appel_rows):
         rejection = (r.get("Rejection message") or "").strip()
         if signal_ref in duplicated_codes:
             anomalies.append(Anomaly(
-                "Unicité", r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
+                "Unicité", "Doublon signal code",
+                r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
                 "Signal reference dupliqué",
                 signal_ref,
             ))
@@ -291,7 +295,8 @@ def check_unicite(appel_rows):
             # Uniquement si toujours au statut Rejected : si la réponse est devenue Final,
             # le rejet a déjà été corrigé et n'est plus une anomalie à traiter.
             anomalies.append(Anomaly(
-                "Unicité", r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
+                "Unicité", "Doublon signal code",
+                r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
                 "Rejet mWater pour doublon de signal code",
                 signal_ref if signal_ref else "Signal reference vide",
             ))
@@ -334,7 +339,7 @@ def check_coherence(appel_rows, maintenance_rows, reparation_rows):
         # 1. Préfixe de déploiement
         if deployment and code_prefix != deployment:
             anomalies.append(Anomaly(
-                "Cohérence", rc, wp,
+                "Cohérence", "Préfixe déploiement", rc, wp,
                 "Préfixe du signal code différent du déploiement déclaré",
                 f"Signal reference : {signal_ref} / Deployment : {deployment}",
             ))
@@ -345,13 +350,13 @@ def check_coherence(appel_rows, maintenance_rows, reparation_rows):
 
         if pump_state == "Partially" and not found_in_maintenance:
             anomalies.append(Anomaly(
-                "Cohérence", rc, wp,
+                "Cohérence", "Présence dans le bon formulaire", rc, wp,
                 "Pompe 'Partiellement' fonctionnelle mais signal code absent du formulaire Maintenance préventive",
                 f"Signal reference : {signal_ref}",
             ))
         elif pump_state == "No" and not found_in_reparation:
             anomalies.append(Anomaly(
-                "Cohérence", rc, wp,
+                "Cohérence", "Présence dans le bon formulaire", rc, wp,
                 "Pompe 'Non' fonctionnelle mais signal code absent du formulaire Réparation après panne",
                 f"Signal reference : {signal_ref}",
             ))
@@ -366,7 +371,7 @@ def check_coherence(appel_rows, maintenance_rows, reparation_rows):
             completion = parse_dt(match.get("Completion date of the work"))
             if completion and code_date > completion.date():
                 anomalies.append(Anomaly(
-                    "Cohérence", rc, wp,
+                    "Cohérence", "Date signal code vs activité", rc, wp,
                     "Date du signal code postérieure à la date de l'activité",
                     f"Signal code : {signal_ref} (date : {code_date}) / "
                     f"Completion date of the work : {completion.date()}",
@@ -410,14 +415,14 @@ def check_fiabilite(appel_rows, rehab_rows):
 
         if wp in success_wp_ids:
             anomalies.append(Anomaly(
-                "Fiabilité", rc, wp,
+                "Fiabilité", "Rejet ID incorrect", rc, wp,
                 "Rejet 'ID incorrect' potentiellement injustifié",
                 f"Ce Water Point ID existe dans la liste des Premières réhabilitations réussies (Status Final)",
             ))
         elif wp in all_wp_context:
             context = "; ".join(f"{t or 'type inconnu'} ({s})" for t, s in all_wp_context[wp])
             anomalies.append(Anomaly(
-                "Fiabilité", rc, wp,
+                "Fiabilité", "Rejet ID incorrect", rc, wp,
                 "Rejet 'ID incorrect' à réexaminer — WP ID trouvé ailleurs dans le datagrid Réhabilitation",
                 f"Trouvé sous : {context}",
             ))
@@ -437,7 +442,7 @@ def build_report(anomalies, output_path):
     wb = Workbook()
     ws = wb.active
     ws.title = "Anomalies"
-    headers = ["Dimension", "Response Code", "Water Point ID", "Description", "Détails"]
+    headers = ["Dimension", "Sous-dimension", "Response Code", "Water Point ID", "Description", "Détails"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
