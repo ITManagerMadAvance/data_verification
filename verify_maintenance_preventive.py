@@ -417,7 +417,10 @@ def check_fiabilite(appel_rows, rehab_rows):
 
     for r in appel_rows:
         rejection = (r.get("Rejection message") or "").strip()
-        if "id incorrect" not in rejection.lower():
+        status = r.get("Status")
+        if status != "Rejected" or "id incorrect" not in rejection.lower():
+            # Comme pour Unicité : si la réponse est redevenue Final, le rejet a déjà
+            # été corrigé et n'est plus une anomalie à traiter.
             continue
 
         rc = r.get("Response Code", "")
