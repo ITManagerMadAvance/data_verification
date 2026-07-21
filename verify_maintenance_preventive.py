@@ -279,14 +279,17 @@ def check_unicite(appel_rows):
     duplicated_codes = {code for code, n in counts.items() if n > 1}
     for r in appel_rows:
         signal_ref = r.get("Signal reference", "").strip()
+        status = r.get("Status")
         rejection = (r.get("Rejection message") or "").strip()
         if signal_ref in duplicated_codes:
             anomalies.append(Anomaly(
                 "Unicité", r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
                 "Signal reference dupliqué",
-                f"Code : {signal_ref} (x{counts[signal_ref]})",
+                signal_ref,
             ))
-        elif "doublon" in rejection.lower():
+        elif status == "Rejected" and "doublon" in rejection.lower():
+            # Uniquement si toujours au statut Rejected : si la réponse est devenue Final,
+            # le rejet a déjà été corrigé et n'est plus une anomalie à traiter.
             anomalies.append(Anomaly(
                 "Unicité", r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
                 "Rejet mWater pour doublon de signal code",
