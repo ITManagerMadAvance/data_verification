@@ -58,7 +58,8 @@ LOG_FILE_NAME = "data_verification_call_log.xlsx"
 
 LOG_HEADERS = [
     "Dimension", "Sous-dimension", "Response Code", "Water Point ID",
-    "Description", "Détails", "Statut", "Première détection",
+    "Description", "Détails", "Signal code", "Maintenance préventive",
+    "Réparation après panne", "Statut", "Première détection",
     "Dernière détection", "Date de résolution",
 ]
 
@@ -489,7 +490,21 @@ def build_submitted_on_lookup(appel_rows):
     return lookup
 
 
-def merge_with_log(current_anomalies, existing_rows, today_str, submitted_on_lookup=None):
+def build_signal_code_lookups(appel_rows, maintenance_rows, reparation_rows):
+    """Pour chaque Response Code (Appel), donne son Signal reference, et deux index par
+    signal code pour savoir si ce code est présent dans Maintenance préventive / Réparation
+    après panne — utilisé pour enrichir chaque ligne du log avec ce contexte de croisement."""
+    signal_by_rc = {
+        r.get("Response Code"): (r.get("Signal reference") or "").strip()
+        for r in appel_rows
+    }
+    maint_idx = index_by_signal_code(maintenance_rows)
+    rep_idx = index_by_signal_code(reparation_rows)
+    return signal_by_rc, maint_idx, rep_idx
+
+
+def merge_with_log(current_anomalies, existing_rows, today_str, submitted_on_lookup=None,
+                    signal_lookups=None):
     """Fusionne les anomalies détectées aujourd'hui avec le log existant :
     - toujours présente -> Statut 'Toujours ouvert', Dernière détection mise à jour
     - nouvelle -> Statut 'Nouveau'
@@ -499,6 +514,7 @@ def merge_with_log(current_anomalies, existing_rows, today_str, submitted_on_loo
     - déjà marquée 'Résolu' avant -> conservée telle quelle (historique)
     """
     submitted_on_lookup = submitted_on_lookup or {}
+    signal_by_rc, maint_idx, rep_idx = signal_lookups or ({}, {}, {})
     existing_open = {}
     already_resolved = []
     for row in existing_rows:
@@ -518,6 +534,7 @@ def merge_with_log(current_anomalies, existing_rows, today_str, submitted_on_loo
         existing = existing_open.get(key)
         if not existing:
             new_count += 1
+        code = signal_by_rc.get(a.response_code, "")
         merged.append({
             "Dimension": a.dimension,
             "Sous-dimension": a.subdimension,
@@ -525,6 +542,9 @@ def merge_with_log(current_anomalies, existing_rows, today_str, submitted_on_loo
             "Water Point ID": a.water_point_id,
             "Description": a.description,
             "Détails": a.details,
+            "Signal code": code,
+            "Maintenance préventive": "Oui" if code and code in maint_idx else "Non",
+            "Réparation après panne": "Oui" if code and code in rep_idx else "Non",
             "Statut": "Toujours ouvert" if existing else "Nouveau",
             "Première détection": existing.get("Première détection") if existing else today_str,
             "Dernière détection": today_str,
@@ -680,8 +700,10 @@ def main():
 
     today_str = datetime.now().strftime("%d/%m/%Y")
     submitted_on_lookup = build_submitted_on_lookup(appel_rows)
+    signal_lookups = build_signal_code_lookups(appel_rows, maintenance_rows, reparation_rows)
     merged_rows, new_count, resolved_count = merge_with_log(
-        anomalies, existing_rows, today_str, submitted_on_lookup=submitted_on_lookup)
+        anomalies, existing_rows, today_str,
+        submitted_on_lookup=submitted_on_lookup, signal_lookups=signal_lookups)
     open_rows = [r for r in merged_rows if r.get("Statut") != "Résolu"]
     print(f"  {len(open_rows)} anomalies ouvertes ({new_count} nouvelles, {resolved_count} résolues)")
 
