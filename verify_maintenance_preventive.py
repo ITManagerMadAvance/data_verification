@@ -28,6 +28,7 @@ d'authentification mWater et Microsoft Graph.
 
 import csv
 import io
+import json
 import os
 import re
 import sys
@@ -47,6 +48,9 @@ DATAGRID_APPEL = "5f443b8a8c144502a304c8c5c24d4f82"
 DATAGRID_MAINTENANCE = "2cfe0ba7ac264d119cfc8964b5f3cebc"
 DATAGRID_REPARATION = "d9f1c36a2d6340429658b6628fe81b88"
 DATAGRID_REHAB = "0638d32971704164b9ac22d549d4818e"
+
+# ID du formulaire "Appel maintenance préventive" (pour les requêtes de réponses brutes)
+FORM_APPEL = "c08b3fe26d0f42c084074701f29eb75e"
 
 SIGNAL_CODE_RE = re.compile(r"^([A-Z]+)_(\d{2})(\d{2})(\d{4})_([ES])(\d+)$")
 
@@ -93,6 +97,37 @@ def download_datagrid(datagrid_id, client_id):
     text = resp.content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
     return list(reader)
+
+
+def fetch_raw_responses_by_code(client_id, form_id, codes, chunk_size=200):
+    """Récupère les réponses brutes mWater (endpoint /responses, avant jointure du datagrid)
+    pour une liste de 'Response Code'. Sert à distinguer un champ jamais répondu d'un champ
+    répondu dont l'entité liée (ex. Water Point) a été supprimée : dans ce cas, le datagrid
+    exporte le champ vide alors que la réponse contient bien une référence à une entité,
+    visible dans le tableau `entities` de la réponse brute.
+    """
+    results = {}
+    codes = [c for c in codes if c]
+    for i in range(0, len(codes), chunk_size):
+        chunk = codes[i:i + chunk_size]
+        resp = requests.get(
+            f"{MWATER_API_BASE}/responses",
+            params={
+                "client": client_id,
+                "filter": json.dumps({"form": form_id, "code": {"$in": chunk}}),
+            },
+            timeout=60,
+        )
+        raise_for_status_verbose(resp)
+        for item in resp.json():
+            results[item.get("code")] = item
+    return results
+
+
+def has_entity_reference(raw_response, entity_type="water_point"):
+    if not raw_response:
+        return False
+    return any(e.get("entityType") == entity_type for e in raw_response.get("entities", []))
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +179,10 @@ class Anomaly:
 # Dimension : Complétude
 # ---------------------------------------------------------------------------
 
-def check_completude(appel_rows):
+def check_completude(appel_rows, client_id=None):
     anomalies = []
+    ambiguous = []  # rows Final avec WP ID vide dans le datagrid : à désambiguïser via l'API brute
+
     for r in appel_rows:
         status = r.get("Status", "")
         rc = r.get("Response Code", "")
@@ -157,8 +194,25 @@ def check_completude(appel_rows):
                 f"Drafted On: {r.get('Drafted On', '')}",
             ))
         elif status == "Final" and not wp.strip():
+            ambiguous.append(rc)
+
+    resolved = {}
+    if client_id and ambiguous:
+        raw = fetch_raw_responses_by_code(client_id, FORM_APPEL, ambiguous)
+        resolved = {code: has_entity_reference(raw.get(code)) for code in ambiguous}
+
+    for rc in ambiguous:
+        if resolved.get(rc):
+            # La réponse contient bien une référence à un Water Point, mais le datagrid
+            # l'exporte vide -> le site lié a probablement été supprimé/est inaccessible.
             anomalies.append(Anomaly(
-                "Complétude", rc, wp,
+                "Complétude", rc, "",
+                "Water Point ID répondu mais site associé supprimé ou inaccessible",
+                "Non résolu dans l'export mWater malgré une réponse valide (à vérifier dans le portail)",
+            ))
+        else:
+            anomalies.append(Anomaly(
+                "Complétude", rc, "",
                 "Réponse finalisée sans Water Point ID renseigné",
             ))
     return anomalies
@@ -485,7 +539,7 @@ def main():
 
     print("Application des règles de vérification...")
     anomalies = []
-    anomalies += check_completude(appel_rows)
+    anomalies += check_completude(appel_rows, client_id=client_id)
     anomalies += check_promptitude(appel_rows)
     anomalies += check_validite(appel_rows)
     anomalies += check_unicite(appel_rows)
