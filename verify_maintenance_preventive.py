@@ -290,7 +290,7 @@ def check_unicite(appel_rows):
             anomalies.append(Anomaly(
                 "Unicité", r.get("Response Code", ""), r.get("Water Point ID > Unique ID", ""),
                 "Rejet mWater pour doublon de signal code",
-                f"Message : {rejection}",
+                signal_ref if signal_ref else "Signal reference vide",
             ))
     return anomalies
 
