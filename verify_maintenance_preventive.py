@@ -477,13 +477,28 @@ def download_existing_log(token, drive_id, folder_item_id, file_name):
     return rows
 
 
-def merge_with_log(current_anomalies, existing_rows, today_str):
+def build_submitted_on_lookup(appel_rows):
+    """Associe chaque Response Code à son dernier Submitted On (format JJ/MM/AAAA),
+    utilisé comme date de résolution réelle plutôt que la date d'exécution du script."""
+    lookup = {}
+    for r in appel_rows:
+        rc = r.get("Response Code")
+        dt = parse_dt(r.get("Submitted On"))
+        if rc and dt:
+            lookup[rc] = dt.strftime("%d/%m/%Y")
+    return lookup
+
+
+def merge_with_log(current_anomalies, existing_rows, today_str, submitted_on_lookup=None):
     """Fusionne les anomalies détectées aujourd'hui avec le log existant :
     - toujours présente -> Statut 'Toujours ouvert', Dernière détection mise à jour
     - nouvelle -> Statut 'Nouveau'
-    - présente avant mais plus détectée aujourd'hui -> Statut 'Résolu' (avec date de résolution)
+    - présente avant mais plus détectée aujourd'hui -> Statut 'Résolu', avec pour date de
+      résolution le Submitted On de la réponse si connu (date réelle de la correction dans
+      mWater), sinon la date d'exécution du script en repli
     - déjà marquée 'Résolu' avant -> conservée telle quelle (historique)
     """
+    submitted_on_lookup = submitted_on_lookup or {}
     existing_open = {}
     already_resolved = []
     for row in existing_rows:
@@ -521,7 +536,7 @@ def merge_with_log(current_anomalies, existing_rows, today_str):
         if key not in seen_keys:
             row = dict(row)
             row["Statut"] = "Résolu"
-            row["Date de résolution"] = today_str
+            row["Date de résolution"] = submitted_on_lookup.get(row.get("Response Code"), today_str)
             merged.append(row)
             resolved_count += 1
 
@@ -664,7 +679,9 @@ def main():
     print(f"  {len(existing_rows)} lignes déjà présentes dans le log")
 
     today_str = datetime.now().strftime("%d/%m/%Y")
-    merged_rows, new_count, resolved_count = merge_with_log(anomalies, existing_rows, today_str)
+    submitted_on_lookup = build_submitted_on_lookup(appel_rows)
+    merged_rows, new_count, resolved_count = merge_with_log(
+        anomalies, existing_rows, today_str, submitted_on_lookup=submitted_on_lookup)
     open_rows = [r for r in merged_rows if r.get("Statut") != "Résolu"]
     print(f"  {len(open_rows)} anomalies ouvertes ({new_count} nouvelles, {resolved_count} résolues)")
 
