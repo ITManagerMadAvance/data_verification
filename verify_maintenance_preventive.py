@@ -197,15 +197,9 @@ def check_completude(appel_rows, client_id=None):
             ))
         elif status == "Final" and not wp.strip():
             if dont_know:
-                # Réponse explicite "je ne sais pas" -> pas une omission, mais un point d'eau
-                # non identifié malgré tout (utile à signaler, mais pas à confondre avec les
-                # deux autres cas).
-                anomalies.append(Anomaly(
-                    "Complétude", rc, "",
-                    "Water Point ID marqué 'Don't Know' — point d'eau non identifié",
-                ))
-            else:
-                ambiguous.append(rc)
+                # Réponse explicite "je ne sais pas" -> réponse valide, pas une anomalie.
+                continue
+            ambiguous.append(rc)
 
     resolved = {}
     if client_id and ambiguous:
