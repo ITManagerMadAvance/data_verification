@@ -52,6 +52,16 @@ DATAGRID_REHAB = "0638d32971704164b9ac22d549d4818e"
 # ID du formulaire "Appel maintenance préventive" (pour les requêtes de réponses brutes)
 FORM_APPEL = "c08b3fe26d0f42c084074701f29eb75e"
 
+# Fichier de log unique, mis à jour à chaque exécution (pas de nom horodaté :
+# c'est le même fichier qui s'enrichit / se met à jour dans le temps)
+LOG_FILE_NAME = "data_verification_call_log.xlsx"
+
+LOG_HEADERS = [
+    "Dimension", "Sous-dimension", "Response Code", "Water Point ID",
+    "Description", "Détails", "Statut", "Première détection",
+    "Dernière détection", "Date de résolution",
+]
+
 SIGNAL_CODE_RE = re.compile(r"^([A-Z]+)_(\d{2})(\d{2})(\d{4})_([ES])(\d+)$")
 
 DEPLOYMENT_PREFIX_MAP = {
@@ -432,33 +442,114 @@ def check_fiabilite(appel_rows, rehab_rows):
 
 
 # ---------------------------------------------------------------------------
-# Rapport Excel
+# Rapport Excel — log unique avec suivi Nouveau / Toujours ouvert / Résolu
 # ---------------------------------------------------------------------------
 
-def build_report(anomalies, output_path):
+def anomaly_key(a):
+    """Identifiant stable d'une anomalie à travers les exécutions successives."""
+    return (a.dimension, a.subdimension, a.response_code, a.description)
+
+
+def download_existing_log(token, drive_id, folder_item_id, file_name):
+    """Télécharge le log existant sur SharePoint. Retourne [] si le fichier n'existe pas encore
+    (première exécution)."""
+    resp = requests.get(
+        f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{folder_item_id}:/{file_name}:/content",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
+    )
+    if resp.status_code == 404:
+        return []
+    raise_for_status_verbose(resp)
+
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(resp.content))
+    ws = wb["Anomalies"]
+    headers = [c.value for c in ws[1]]
+    rows = []
+    for values in ws.iter_rows(min_row=2, values_only=True):
+        row = dict(zip(headers, values))
+        if row.get("Dimension"):  # ignore lignes vides éventuelles
+            rows.append(row)
+    return rows
+
+
+def merge_with_log(current_anomalies, existing_rows, today_str):
+    """Fusionne les anomalies détectées aujourd'hui avec le log existant :
+    - toujours présente -> Statut 'Toujours ouvert', Dernière détection mise à jour
+    - nouvelle -> Statut 'Nouveau'
+    - présente avant mais plus détectée aujourd'hui -> Statut 'Résolu' (avec date de résolution)
+    - déjà marquée 'Résolu' avant -> conservée telle quelle (historique)
+    """
+    existing_open = {}
+    already_resolved = []
+    for row in existing_rows:
+        key = (row.get("Dimension"), row.get("Sous-dimension"), row.get("Response Code"), row.get("Description"))
+        if row.get("Statut") == "Résolu":
+            already_resolved.append(row)
+        else:
+            existing_open[key] = row
+
+    merged = []
+    seen_keys = set()
+    new_count = 0
+
+    for a in current_anomalies:
+        key = anomaly_key(a)
+        seen_keys.add(key)
+        existing = existing_open.get(key)
+        if not existing:
+            new_count += 1
+        merged.append({
+            "Dimension": a.dimension,
+            "Sous-dimension": a.subdimension,
+            "Response Code": a.response_code,
+            "Water Point ID": a.water_point_id,
+            "Description": a.description,
+            "Détails": a.details,
+            "Statut": "Toujours ouvert" if existing else "Nouveau",
+            "Première détection": existing.get("Première détection") if existing else today_str,
+            "Dernière détection": today_str,
+            "Date de résolution": "",
+        })
+
+    resolved_count = 0
+    for key, row in existing_open.items():
+        if key not in seen_keys:
+            row = dict(row)
+            row["Statut"] = "Résolu"
+            row["Date de résolution"] = today_str
+            merged.append(row)
+            resolved_count += 1
+
+    merged.extend(already_resolved)
+    return merged, new_count, resolved_count
+
+
+def build_log_report(merged_rows, output_path):
     from openpyxl import Workbook
     from openpyxl.styles import Font
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Anomalies"
-    headers = ["Dimension", "Sous-dimension", "Response Code", "Water Point ID", "Description", "Détails"]
-    ws.append(headers)
+    ws.append(LOG_HEADERS)
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
-    for a in anomalies:
-        ws.append(a.as_row())
+    for row in merged_rows:
+        ws.append([row.get(h, "") for h in LOG_HEADERS])
 
-    # Onglet résumé par dimension
+    # Onglet résumé : uniquement les anomalies actuellement ouvertes (Nouveau + Toujours ouvert)
+    open_rows = [r for r in merged_rows if r.get("Statut") != "Résolu"]
     summary = wb.create_sheet("Résumé")
-    summary.append(["Dimension", "Nombre d'anomalies"])
+    summary.append(["Dimension", "Nombre d'anomalies ouvertes"])
     for cell in summary[1]:
         cell.font = Font(bold=True)
-    counts = Counter(a.dimension for a in anomalies)
+    counts = Counter(r.get("Dimension") for r in open_rows)
     for dimension in ["Complétude", "Promptitude", "Validité", "Unicité", "Cohérence", "Fiabilité"]:
         summary.append([dimension, counts.get(dimension, 0)])
-    summary.append(["Total", len(anomalies)])
+    summary.append(["Total ouvert", len(open_rows)])
 
     wb.save(output_path)
 
@@ -498,13 +589,15 @@ def upload_to_sharepoint(token, drive_id, folder_item_id, file_path, file_name):
     return resp.json()
 
 
-def send_confirmation_email(token, sender, recipients, file_name, anomaly_count, counts_by_dimension):
+def send_confirmation_email(token, sender, recipients, file_name, open_count, new_count,
+                             resolved_count, counts_by_dimension):
     lines = "".join(f"<li>{dim} : {n}</li>" for dim, n in counts_by_dimension.items())
     body_html = (
         f"<p>Vérification de données \"Appel maintenance préventive\" exécutée.</p>"
-        f"<p>Total anomalies détectées : <b>{anomaly_count}</b></p>"
+        f"<p>Anomalies actuellement ouvertes : <b>{open_count}</b> "
+        f"(dont {new_count} nouvelles) — {resolved_count} résolue(s) depuis la dernière exécution.</p>"
         f"<ul>{lines}</ul>"
-        f"<p>Rapport déposé sur SharePoint : <b>{file_name}</b></p>"
+        f"<p>Log mis à jour sur SharePoint : <b>{file_name}</b></p>"
     )
     resp = requests.post(
         f"https://graph.microsoft.com/v1.0/users/{sender}/sendMail",
@@ -560,20 +653,29 @@ def main():
     anomalies += check_fiabilite(appel_rows, rehab_rows)
     print(f"  {len(anomalies)} anomalies détectées")
 
-    file_name = f"data_verification_call_{datetime.now().strftime('%d%m%Y')}.xlsx"
-    output_path = f"/tmp/{file_name}"
-    build_report(anomalies, output_path)
-    print(f"Rapport généré : {output_path}")
-
     print("Authentification Microsoft Graph...")
     token = graph_token(azure_tenant_id, azure_client_id, azure_client_secret)
 
-    print("Dépôt du rapport sur SharePoint...")
-    upload_to_sharepoint(token, sharepoint_drive_id, sharepoint_folder_item_id, output_path, file_name)
+    print("Téléchargement du log existant sur SharePoint...")
+    existing_rows = download_existing_log(token, sharepoint_drive_id, sharepoint_folder_item_id, LOG_FILE_NAME)
+    print(f"  {len(existing_rows)} lignes déjà présentes dans le log")
+
+    today_str = datetime.now().strftime("%d/%m/%Y")
+    merged_rows, new_count, resolved_count = merge_with_log(anomalies, existing_rows, today_str)
+    open_rows = [r for r in merged_rows if r.get("Statut") != "Résolu"]
+    print(f"  {len(open_rows)} anomalies ouvertes ({new_count} nouvelles, {resolved_count} résolues)")
+
+    output_path = f"/tmp/{LOG_FILE_NAME}"
+    build_log_report(merged_rows, output_path)
+    print(f"Rapport généré : {output_path}")
+
+    print("Dépôt du log mis à jour sur SharePoint...")
+    upload_to_sharepoint(token, sharepoint_drive_id, sharepoint_folder_item_id, output_path, LOG_FILE_NAME)
 
     print("Envoi de l'email de confirmation...")
-    counts_by_dimension = Counter(a.dimension for a in anomalies)
-    send_confirmation_email(token, email_sender, email_recipients, file_name, len(anomalies), counts_by_dimension)
+    counts_by_dimension = Counter(r.get("Dimension") for r in open_rows)
+    send_confirmation_email(token, email_sender, email_recipients, LOG_FILE_NAME,
+                             len(open_rows), new_count, resolved_count, counts_by_dimension)
 
     print("Terminé.")
 

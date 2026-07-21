@@ -6,11 +6,23 @@ Le script `verify_maintenance_preventive.py` :
 
 1. S'authentifie sur l'API mWater et télécharge 4 datagrids déjà configurés dans le portail (Appel maintenance préventive, Maintenance préventive, Réparation après panne, Première réhabilitation).
 2. Applique les règles de vérification (voir le détail dans le manuel ClickUp lié).
-3. Génère un rapport Excel horodaté `data_verification_call_JJMMAAAA.xlsx` (onglet détail + onglet résumé par dimension).
-4. Dépose le rapport sur SharePoint via Microsoft Graph.
-5. Envoie un email de confirmation avec le décompte d'anomalies par dimension.
+3. Télécharge le log existant sur SharePoint (`data_verification_call_log.xlsx`) et le fusionne avec les anomalies détectées aujourd'hui.
+4. Réenregistre ce même fichier (nom fixe, pas de date dans le nom) sur SharePoint via Microsoft Graph.
+5. Envoie un email de confirmation avec le décompte d'anomalies ouvertes par dimension, plus le nombre de nouvelles et de résolues.
 
 Exécution automatique hebdomadaire via GitHub Actions (lundi 06:30 UTC), ou manuelle via `workflow_dispatch`. Ne modifie jamais les données mWater — uniquement de la détection/reporting. La correction reste une étape manuelle séparée.
+
+### Le fichier de log (`data_verification_call_log.xlsx`)
+
+Contrairement à un rapport horodaté recréé à chaque exécution, c'est **le même fichier** qui est mis à jour à chaque run — il sert d'historique cumulé. Chaque ligne du log a un identifiant stable (Dimension + Sous-dimension + Response Code + Description) qui permet de reconnaître une anomalie d'une exécution à l'autre, et un `Statut` :
+
+- **Nouveau** : détectée pour la première fois.
+- **Toujours ouvert** : déjà vue lors d'une exécution précédente, toujours présente.
+- **Résolu** : présente avant, plus détectée aujourd'hui — considérée comme corrigée. La ligne reste dans le fichier (historique), mais n'est plus mise à jour.
+
+Colonnes : `Dimension`, `Sous-dimension`, `Response Code`, `Water Point ID`, `Description`, `Détails`, `Statut`, `Première détection`, `Dernière détection`, `Date de résolution`. L'onglet "Résumé" ne compte que les anomalies actuellement ouvertes (Nouveau + Toujours ouvert), pas les résolues.
+
+Si le fichier n'existe pas encore sur SharePoint (première exécution), le script part d'un log vide et toutes les anomalies détectées sont marquées "Nouveau".
 
 ## Secrets GitHub Actions requis (Settings > Secrets and variables > Actions)
 
@@ -62,4 +74,6 @@ python verify_maintenance_preventive.py
 
 ## Test de validation (logique seule, sans upload)
 
-Testé le 21/07/2026 sur un export réel des 4 datagrids (3073 réponses Appel, 732 Maintenance, 171 Réparation, 1688 Réhabilitation) : 313 anomalies détectées (Cohérence 186, Unicité 57, Complétude 40, Promptitude 29, Fiabilité 1). Le nombre de cas Cohérence est nettement supérieur aux quelques exemples relevés manuellement dans le manuel de vérification — probablement parce que la vérification manuelle n'avait couvert qu'un échantillon, pas l'historique complet. **À valider avec Lanja avant mise en production** : passer en revue un échantillon des anomalies "absent du formulaire" pour confirmer qu'il ne s'agit pas de faux positifs (ex. suivi encore en attente plutôt qu'anomalie réelle).
+Testé le 21/07/2026 sur un export réel des 4 datagrids (3073 réponses Appel, 732 Maintenance, 171 Réparation, 1688 Réhabilitation), après plusieurs corrections faites avec Lanja en cours de route (distinction site supprimé/Don't Know en Complétude, exclusion des rejets déjà corrigés en Unicité, etc.) : 299 anomalies détectées (Cohérence 186, Unicité 50, Promptitude 29, Complétude 33, Fiabilité 1). **À valider avec Lanja avant mise en production** : passer en revue un échantillon des anomalies de Cohérence "absent du formulaire" pour confirmer qu'il ne s'agit pas de faux positifs (ex. suivi encore en attente plutôt qu'anomalie réelle).
+
+La logique de log (Nouveau / Toujours ouvert / Résolu) a été testée par simulation de deux exécutions successives : les statuts et dates de première/dernière détection et de résolution se comportent comme attendu. Pas encore testée en conditions réelles sur deux exécutions GitHub Actions successives.
